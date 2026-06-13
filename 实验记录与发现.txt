@@ -1,0 +1,206 @@
+广告点击率预测项目 — 实验记录与发现
+=========================================
+日期: 2026-06-05
+
+一、项目概况
+------------
+业务目标: 预测用户看到广告后是否会点击（二分类）
+数据规模: 训练集约 46.3 万行 × 15 列，测试集约 12.8 万行 × 14 列
+类别分布: 约 93.24% 未点击 vs 6.76% 点击（自然分布）
+特征类型: 用户画像（gender, age, user_depth）、广告/产品（product, campaign_id,
+          webpage_id）、时间戳（DateTime → hour, day_of_week）等
+
+二、已完成的实验
+----------------
+
+实验1: 基线模型对比（LightGBM vs CatBoost）
+  方法: 仅使用基础类别特征，无特征工程
+  结果:
+    - LightGBM: AUC=0.5957, LogLoss=0.2437
+    - CatBoost:  AUC=0.5952, LogLoss=0.2438
+  发现:
+    - 两个 GBDT 框架在相同特征下表现几乎一致
+    - AUC 0.595 是该数据集在不做特征工程下的"基础信号水平"
+    - 模型准确率(0.9324)与"全部预测0"持平，因为数据极度不平衡
+    - Top 特征: campaign_id, user_id, product, hour
+
+────────────────────────────────────────────────────────
+
+实验2: 特征工程增强（Count + Target Encoding）
+  方法:
+    - Count Encoding: user_id, campaign_id, webpage_id, product 的出现频次
+    - Target Encoding (5-Fold): campaign_id, user_id, webpage_id,
+      product_category_1 的点击率均值（防泄漏）
+    - LightGBM（num_leaves=63, max_depth=8）
+  结果:
+    - AUC=0.6376, LogLoss=0.2397
+  发现:
+    - 比基线提升 +4.2%（AUC: 0.5957 → 0.6376），是最显著的提分步骤
+    - user_id_target_enc 和 user_id_count 成为最重要的两个特征
+    - 特征工程的价值远超模型选型
+
+────────────────────────────────────────────────────────
+
+实验3: DeepFM 深度学习模型
+  方法:
+    - PyTorch + DeepCTR 库，GPU (CUDA) 加速
+    - embedding_dim=4, DNN hidden=(128, 64), Dropout=0.3
+    - L2 正则化 (1e-3)，Early Stopping patience=2
+  结果:
+    - 最终测试集 AUC=0.6141, LogLoss=0.2524
+    - 训练 AUC 在第4轮已达 0.9506，验证 AUC 最高仅 0.6151，严重过拟合
+  发现:
+    - DeepFM 表现不如 LightGBM（0.6141 vs 0.6376）
+    - 尽管已加 L2 + Dropout + 小 embedding，过拟合仍然严重
+    - 可能原因: embedding_dim 太小学不到有效表示，或稀疏特征基数太高
+      （大量低频ID），DeepFM 需要更多调参工作
+
+────────────────────────────────────────────────────────
+
+实验4: 负样本下采样 + Platt Scaling 校准（核心实验）
+  方法:
+    - 对训练集做不同比例负样本下采样（原始 / 1:8 / 1:4 / 1:2 / 1:1）
+    - 验证集和测试集保持原始分布
+    - 用 Platt Scaling (无正则化 Logistic Regression) 在 Calib 集上校准
+    - 在测试集上对比校准前后的 AUC / LogLoss / Brier Score
+  结果:
+
+    实验组       |训练量  |正样本率| AUC   |未校准LogLoss|校准后LogLoss|未校准Brier|校准后Brier
+    ─────────────┼───────┼───────┼───────┼───────────┼───────────┼──────────┼─────────
+    无下采样      |277,974| 6.76% |0.6354 |0.2399     |0.2408     |0.0620    |0.0622
+    1:8 下采样   |169,191|11.11% |0.6360 |0.2507     |0.2405     |0.0641    |0.0622
+    1:4 下采样   | 93,995|20.00% |0.6352 |0.3079     |0.2403     |0.0804    |0.0621
+    1:2 下采样   | 56,397|33.33% |0.6331 |0.4377     |0.2404     |0.1316    |0.0621
+    1:1 下采样   | 37,598|50.00% |0.6308 |0.6664     |0.2405     |0.2371    |0.0621
+
+  核心发现:
+
+    发现一: 下采样没有提升排序能力，反而在伤害它
+    ──────────────────────────────────────────────
+    AUC 从原始 0.6354 → 1:1 下采样后降到 0.6308。
+    LightGBM 的梯度提升机制天然会给少数类（正样本）更大的梯度权重，
+    不需要手动重采样来"提醒"它。强行下采样反而丢弃了大量负样本中
+    包含的分布信息（1:1 采样仅用 3.7 万条 vs 原始 27.8 万条）。
+
+    发现二: Platt Scaling 完美恢复了概率保真度
+    ──────────────────────────────────────────────
+    1:1 下采样后未校准 LogLoss 高达 0.6664（概率被严重高估约7倍），
+    校准后恢复到 0.2405，与原始模型持平。
+    Brier Score 从 0.2371 恢复到 0.0621。
+    这说明"下采样+校准"的技术路线本身是成立的——校准确实能恢复
+    概率，只是下采样这一步在这个场景下对排序没有帮助。
+
+    发现三: 1:8 下采样是唯一略优于原始的配置
+    ──────────────────────────────────────────────
+    AUC 0.6360 vs 原始 0.6354，差异在误差范围内（±0.0006），
+    但至少证明轻度下采样不会伤害模型。1:8（正样本率 11%）去除了
+    约 40% 的负样本，在训练速度和效果之间取得了平衡。
+
+    论文价值:
+    ─────────
+    这个"反常识"结论本身就是很好的论文素材：
+    "GBDT 对 CTR 自然不平衡数据具有鲁棒性——下采样不仅无益，
+    反而因丢弃信息而降低排序能力。"
+
+三、当前最佳成绩 🏆
+────────────────────
+    ROC AUC: 0.6484 (LightGBM + 73特征 + 3阶交叉 + Optuna参数)
+    LogLoss: 0.2383
+
+    从起点提升: +0.0527 (0.5957 → 0.6484, +8.8%)
+    从特征工程基线提升: +0.0108 (0.6376 → 0.6484)
+
+四、模型演进总览 & 完整实验
+──────────────────────────────
+
+  序号  实验                           AUC     较上一步     关键点
+  ────  ────────────────────────────  ──────   ────────    ──────
+  1     LightGBM 基线                  0.5957   —           仅类别特征
+  2     CatBoost 基线                  0.5952   -0.0005     与LGB持平
+  3     + Count/Target Encoding       0.6376   +0.0419     **最大单次提升**
+  4     + 5层全面特征工程              0.6441   +0.0065     交叉/聚合/时序/比率/共现
+  5     + 时间窗口特征 (Layer 6)       0.6455   +0.0014     从原始DateTime提取
+  6     + Optuna 超参调优 (25 trials)  0.6471   +0.0016    自动搜索最优参数
+  7     + Stacking 融合 (3模型)        0.6482   +0.0011     LGB+XGB+CB→LR
+  8     + 3阶交叉 + 最优参数 (当前)    0.6484   +0.0002     6个3阶交叉全部进入Top30
+
+  总提升: +0.0527 (0.5957 → 0.6484, +8.8%)
+
+五、Stacking 融合详细结果
+──────────────────────────
+
+  各模型独立表现:
+    LightGBM Test AUC: 0.6477
+    XGBoost  Test AUC: 0.6464
+    CatBoost Test AUC: 0.6462
+
+  融合表现:
+    Stacking (LR Meta-Learner): 0.6482
+    简单平均融合:                 0.6481
+
+  发现:
+    - 三模型高度相关（预测结果接近），融合收益仅 0.0011
+    - LR 几乎退化为简单加权，交互项系数很小
+    - 结论: GBDT 模型家族之间的相似性限制了 Stacking 的上限
+
+六、实验5: 全面特征工程 (6层, 67个特征)
+────────────────────────────────────────
+
+  Layer 1 — 笛卡尔积交叉 (7组):
+    gender_x_pcat1, gender_x_pcat2, udepth_x_pcat1, age_x_pcat1,
+    hour_x_dow, ugroup_x_camp, pcat1_x_pcat2
+    效果: ugroup_x_camp (Top 4), hour_x_dow (Top 5)
+
+  Layer 2 — 群体聚合统计 (14个):
+    各实体的 click_rate + impression_count
+    效果: user_id_imp_count, user_id_ctr 等进入 Top 20
+
+  Layer 3 — 用户时序行为 (4个):
+    user_avg_hour, user_hour_std, user_impressions_per_day, user_weekday_ratio
+    效果: user_hour_std (Top 9), user_avg_hour (Top 11)
+
+  Layer 4 — 比率/交互 (4个):
+    user_vs_campaign_ctr, user_vs_global_ctr, campaign_vs_global_ctr, user_imp_rank
+    效果: user_vs_campaign_ctr (Top 6)
+
+  Layer 5 — 共现计数 (2个):
+    user_campaign_count, user_product_count
+    效果: user_campaign_count (Top 8)
+
+  Layer 6 — 时间窗口 (7个, 从原始DateTime提取):
+    user_avg_gap_hours, user_max_gap_hours, user_active_span_days,
+    user_night/morning/afternoon/evening_ratio
+    效果: user_active_span_days (Top 8), user_avg_gap_hours (Top 13)
+
+七、Optuna 最佳参数
+────────────────────
+    learning_rate: 0.0213
+    num_leaves: 235
+    max_depth: 8
+    min_data_in_leaf: 106
+    feature_fraction: 0.675
+    bagging_fraction: 0.893
+    bagging_freq: 4
+    lambda_l1: 1.9e-5
+    lambda_l2: 0.00166
+    min_split_gain: 0.002
+    path_smooth: 2.5
+
+八、差距分析 & 下一步
+───────────────────────
+
+  当前 AUC:  0.648  ✓ 已突破 0.64 目标
+  下一目标:  0.650+ (0.650 → 0.655 → 0.660+)
+
+  已证实有效的方法:
+    ✓ 特征工程 (编码+交叉+聚合): +0.042
+    ✓ Optuna 调参: +0.002
+    ✓ Stacking: +0.001 (收益递减)
+
+  尚未尝试:
+    - 3阶特征交叉 (user_group × hour × product_category)
+    - Focal Loss / 加权损失函数
+    - 从原始 DateTime 构建真正的滑动窗口特征 (过去N天)
+    - 特征选择 (移除低信号特征减少噪声)
+    - 重构 DeepFM (xDeepFM / DIN)
+    - 外部数据增强
